@@ -1,5 +1,13 @@
 # torget
 
+## Updates
+
+Needed a couple extra features for the tool so I decided to fork. 
+
+Added:
+- Custom User Agent
+- Get's file info from a GET request rather than a HEAD request. This helps with certain sites who might behaive differently if you supply a HEAD. 
+
 ## Description
 
 The tool downloads large files over a locally installed Tor client by

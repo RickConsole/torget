@@ -49,6 +49,7 @@ type State struct {
 	circuits    int
 	minLifetime time.Duration
 	verbose     bool
+	userAgent   string // Added User-Agent field
 	chunks      []chunk
 	done        chan int
 	log         chan string
@@ -58,17 +59,42 @@ type State struct {
 
 const torBlock = 8000 // the longest plain text block in Tor
 
-func httpClient(user string) *http.Client {
+// Custom transport to inject User-Agent
+type userAgentTransport struct {
+	baseTransport http.RoundTripper
+	userAgent     string
+}
+
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.userAgent != "" {
+		req.Header.Set("User-Agent", t.userAgent)
+	}
+	// If baseTransport is nil, use http.DefaultTransport
+	transport := t.baseTransport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	return transport.RoundTrip(req)
+}
+
+func httpClient(user string, ua string) *http.Client { // Added ua parameter
 	proxyUrl, _ := url.Parse("socks5://" + user + ":" + user + "@127.0.0.1:9050/")
+	baseTransport := &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+	// Wrap the base transport
+	customTransport := &userAgentTransport{
+		baseTransport: baseTransport,
+		userAgent:     ua,
+	}
 	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
+		Transport: customTransport, // Use the custom transport
 	}
 }
 
-func NewState(ctx context.Context, circuits int, minLifetime int, verbose bool) *State {
+func NewState(ctx context.Context, circuits int, minLifetime int, verbose bool, userAgent string) *State { // Added userAgent parameter
 	var s State
 	s.circuits = circuits
 	s.minLifetime = time.Duration(minLifetime) * time.Second
+	s.userAgent = userAgent // Store userAgent
 	s.verbose = verbose
 	s.chunks = make([]chunk, s.circuits)
 	s.ctx = ctx
@@ -98,8 +124,10 @@ func (s *State) chunkInit(id int) (client *http.Client, req *http.Request) {
 	s.chunks[id].since = time.Now()
 	ctx, cancel := context.WithCancel(s.ctx)
 	s.chunks[id].cancel = cancel
-	client = httpClient(fmt.Sprintf("tg%d", s.chunks[id].circuit))
+	// Pass userAgent to httpClient
+	client = httpClient(fmt.Sprintf("tg%d", s.chunks[id].circuit), s.userAgent)
 	req, _ = http.NewRequestWithContext(ctx, "GET", s.src, nil)
+	// User-Agent is now set by the custom transport in httpClient
 	req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d",
 		s.chunks[id].start, s.chunks[id].start+s.chunks[id].length-1))
 	return
@@ -328,14 +356,35 @@ func (s *State) Fetch(src string) int {
 	fmt.Println("Output file:", s.dst)
 
 	// get the target length
-	client := httpClient("torget")
-	resp, err := client.Head(s.src)
+	// Pass userAgent to httpClient
+	client := httpClient("torget", s.userAgent)
+	// Use a GET request instead of HEAD to get the initial length, as some servers might handle HEAD incorrectly.
+	getReq, err := http.NewRequest("GET", s.src, nil)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println("Failed to create initial GET request:", err.Error())
 		return 1
 	}
+	resp, err := client.Do(getReq)
+	if err != nil {
+		fmt.Println("Initial GET request failed:", err.Error())
+		return 1
+	}
+	// IMPORTANT: Close the body immediately after getting the length.
+	// We don't want to download data here, just get the size.
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Printf("Initial GET request returned non-success status: %d %s\n", resp.StatusCode, resp.Status)
+		// Attempt to read body for more details, might be helpful for debugging
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		if len(bodyBytes) > 0 {
+			fmt.Println("Response body:", string(bodyBytes))
+		}
+		return 1
+	}
+
 	if resp.ContentLength <= 0 {
-		fmt.Println("Failed to retrieve download length")
+		fmt.Println("Failed to retrieve download length (Content-Length <= 0)")
 		return 1
 	}
 	s.bytesTotal = resp.ContentLength
@@ -415,6 +464,7 @@ func main() {
 	circuits := flag.Int("circuits", 20, "concurrent circuits")
 	minLifetime := flag.Int("min-lifetime", 10, "minimum circuit lifetime (seconds)")
 	verbose := flag.Bool("verbose", false, "diagnostic details")
+	userAgent := flag.String("user-agent", "", "Custom User-Agent string for HTTP requests (default: Go HTTP client)") // Added user-agent flag
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "torget 2.0, a fast large file downloader over locally installed Tor")
 		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
@@ -429,7 +479,8 @@ func main() {
 		os.Exit(1)
 	}
 	ctx := context.Background()
-	state := NewState(ctx, *circuits, *minLifetime, *verbose)
+	// Pass userAgent flag value to NewState
+	state := NewState(ctx, *circuits, *minLifetime, *verbose, *userAgent)
 	context.Background()
 	os.Exit(state.Fetch(flag.Arg(0)))
 }
